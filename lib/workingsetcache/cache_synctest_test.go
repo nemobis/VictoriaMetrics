@@ -699,6 +699,147 @@ func assertStats(t *testing.T, c *Cache, want fastcache.Stats) {
 	}
 }
 
+// TestGetPromotionAfterConcurrentRotation verifies that when a key is found in
+// prev during Get / Has / GetBig, it is promoted into the *current* curr even
+// if a cache rotation happens between the miss on curr and the promotion write.
+//
+// The race scenario:
+//
+//  1. Get() snapshots curr = C1, then misses on C1.
+//  2. The expiration goroutine rotates: C1 → prev, a reset C0 → curr.
+//  3. Get() finds the key in prev (C1) and promotes it.
+//     BUG (before fix): promotion uses the stale C1 snapshot and writes to C1
+//     (which is now prev). The entry is lost at the next rotation.
+//     FIXED: promotion calls c.curr.Load() at write time, so it writes to the
+//     new curr (C0) and the entry survives.
+//
+// The test uses beforePromotionHook to inject the rotation deterministically.
+func TestGetPromotionAfterConcurrentRotation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		key := []byte("k1")
+		value := []byte("v1")
+
+		c := New(1024 * 1024)
+		defer c.Stop()
+		assertMode(t, c, modeSplit)
+
+		// Put key in curr.
+		c.Set(key, value)
+
+		// Rotate: key moves to prev; curr becomes empty.
+		time.Sleep(*cacheExpireDuration + time.Minute)
+		synctest.Wait()
+
+		// Inject a second rotation just before the promotion write in Get().
+		// This simulates the expirationWatcher firing in between.
+		c.beforePromotionHook = func() {
+			c.beforePromotionHook = nil // fire once
+			c.mu.Lock()
+			prev := c.prev.Load()
+			curr := c.curr.Load()
+			c.updateCacheStatsHistoryBeforeRotationLocked(prev, curr)
+			c.prev.Store(curr)
+			prev.Reset()
+			c.curr.Store(prev)
+			c.mu.Unlock()
+		}
+
+		// Get() should: miss curr (C1), find in prev (C0 which had the key),
+		// trigger the hook (rotation: C1→prev, reset C0→curr), then promote
+		// into the new curr (C0, now reset) rather than the stale C1.
+		result := c.Get(nil, key)
+		if string(result) != string(value) {
+			t.Fatalf("Get() must return the value; got %q", result)
+		}
+
+		// After the promotion the key must be in the new curr (which is now C0,
+		// reset by the hook). With the old code the promotion went to C1 (now
+		// prev), so it would not be in curr.
+		curr := c.curr.Load()
+		if got := curr.Get(nil, key); string(got) != string(value) {
+			t.Fatalf("promoted key must be in curr after a concurrent rotation; got %q", got)
+		}
+	})
+}
+
+func TestHasPromotionAfterConcurrentRotation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		key := []byte("k1")
+		value := []byte("v1")
+
+		c := New(1024 * 1024)
+		defer c.Stop()
+		assertMode(t, c, modeSplit)
+
+		c.Set(key, value)
+		time.Sleep(*cacheExpireDuration + time.Minute)
+		synctest.Wait()
+
+		c.beforePromotionHook = func() {
+			c.beforePromotionHook = nil
+			c.mu.Lock()
+			prev := c.prev.Load()
+			curr := c.curr.Load()
+			c.updateCacheStatsHistoryBeforeRotationLocked(prev, curr)
+			c.prev.Store(curr)
+			prev.Reset()
+			c.curr.Store(prev)
+			c.mu.Unlock()
+		}
+
+		if !c.Has(key) {
+			t.Fatalf("Has() must return true for existing key")
+		}
+
+		curr := c.curr.Load()
+		if got := curr.Get(nil, key); string(got) != string(value) {
+			t.Fatalf("promoted key must be in curr after a concurrent rotation in Has(); got %q", got)
+		}
+	})
+}
+
+func TestGetBigPromotionAfterConcurrentRotation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		// Use a value large enough to exercise SetBig / GetBig.
+		const bigSize = 128 * 1024
+		key := []byte("k1")
+		value := make([]byte, bigSize)
+		for i := range value {
+			value[i] = byte(i)
+		}
+
+		c := New(4 * 1024 * 1024)
+		defer c.Stop()
+		assertMode(t, c, modeSplit)
+
+		c.SetBig(key, value)
+		time.Sleep(*cacheExpireDuration + time.Minute)
+		synctest.Wait()
+
+		c.beforePromotionHook = func() {
+			c.beforePromotionHook = nil
+			c.mu.Lock()
+			prev := c.prev.Load()
+			curr := c.curr.Load()
+			c.updateCacheStatsHistoryBeforeRotationLocked(prev, curr)
+			c.prev.Store(curr)
+			prev.Reset()
+			c.curr.Store(prev)
+			c.mu.Unlock()
+		}
+
+		result := c.GetBig(nil, key)
+		if string(result) != string(value) {
+			t.Fatalf("GetBig() must return the value after concurrent rotation")
+		}
+
+		curr := c.curr.Load()
+		if got := curr.GetBig(nil, key); string(got) != string(value) {
+			t.Fatalf("promoted key must be in curr after a concurrent rotation in GetBig()")
+		}
+	})
+}
+
 // removeAll removes the contents of t.Name() directory if the test succeeded.
 // For this to work, a test is expected to store its data in t.Name() dir.
 // In case of test failure the directory is not removed to allow for manual

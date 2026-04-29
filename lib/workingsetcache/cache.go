@@ -60,6 +60,12 @@ type Cache struct {
 	// wg and stopCh are used for graceful shutdown of background watchers.
 	wg     sync.WaitGroup
 	stopCh chan struct{}
+
+	// beforePromotionHook is called in Get, Has and GetBig right before
+	// promoting an entry found in prev into curr. It is nil in production
+	// and is only set by tests that need to inject a concurrent cache
+	// rotation between the miss on curr and the promotion write.
+	beforePromotionHook func()
 }
 
 func newWithAutoCleanup(maxBytes int) *fastcache.Cache {
@@ -501,7 +507,15 @@ func (c *Cache) Get(dst, key []byte) []byte {
 		return result
 	}
 	// Cache the found entry in the current cache.
-	curr.Set(key, result[len(dst):])
+	// Re-load curr here instead of reusing the snapshot from the top of the
+	// function: a concurrent cache rotation may have swapped curr and prev
+	// between the initial curr.Get() miss and this point. If we used the
+	// stale snapshot, the promoted entry would land in the old curr (now
+	// prev) and be lost at the next rotation.
+	if c.beforePromotionHook != nil {
+		c.beforePromotionHook()
+	}
+	c.curr.Load().Set(key, result[len(dst):])
 	return result
 }
 
@@ -519,9 +533,14 @@ func (c *Cache) Has(key []byte) bool {
 		return false
 	}
 	// Cache the found entry in the current cache.
+	// Re-load curr to avoid promoting into a stale snapshot; see the comment
+	// in Get() for the full explanation.
 	tmpBuf := tmpBufPool.Get()
 	tmpBuf.B = prev.Get(tmpBuf.B, key)
-	curr.Set(key, tmpBuf.B)
+	if c.beforePromotionHook != nil {
+		c.beforePromotionHook()
+	}
+	c.curr.Load().Set(key, tmpBuf.B)
 	tmpBufPool.Put(tmpBuf)
 	return true
 }
@@ -555,7 +574,12 @@ func (c *Cache) GetBig(dst, key []byte) []byte {
 		return result
 	}
 	// Cache the found entry in the current cache.
-	curr.SetBig(key, result[len(dst):])
+	// Re-load curr to avoid promoting into a stale snapshot; see the comment
+	// in Get() for the full explanation.
+	if c.beforePromotionHook != nil {
+		c.beforePromotionHook()
+	}
+	c.curr.Load().SetBig(key, result[len(dst):])
 	return result
 }
 
