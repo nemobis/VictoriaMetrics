@@ -319,6 +319,149 @@ func TestRollupResultCache(t *testing.T) {
 
 }
 
+// TestRollupResultCacheMultiArgFuncKey verifies that two calls to a multi-arg
+// rollup function with different argument values produce separate cache entries
+// and do not return results for each other.
+//
+// Before commit 3e09d38f2 (fix results caching for multi-arg rollup functions
+// such as quantile_over_time) only the first argument of the function was
+// included in the cache key, so quantile_over_time(0.99, ...) and
+// quantile_over_time(0.95, ...) shared the same key and would incorrectly
+// return each other's cached results.
+func TestRollupResultCacheMultiArgFuncKey(t *testing.T) {
+	InitRollupResultCache("")
+	defer StopRollupResultCache()
+	ResetRollupResultCache()
+
+	ec := &EvalConfig{
+		Start:              1000,
+		End:                2000,
+		Step:               200,
+		MaxPointsPerSeries: 1e4,
+		MayCache:           true,
+	}
+	window := int64(500)
+
+	// Build quantile_over_time(0.99, foo) and quantile_over_time(0.95, foo).
+	metricExpr := &metricsql.MetricExpr{
+		LabelFilterss: [][]metricsql.LabelFilter{{{Label: "__name__", Value: "foo"}}},
+	}
+	makeQuantile := func(q float64) *metricsql.FuncExpr {
+		return &metricsql.FuncExpr{
+			Name: "quantile_over_time",
+			Args: []metricsql.Expr{
+				&metricsql.NumberExpr{N: q},
+				metricExpr,
+			},
+		}
+	}
+	expr99 := makeQuantile(0.99)
+	expr95 := makeQuantile(0.95)
+
+	tss99 := []*timeseries{{
+		Timestamps: []int64{1000, 1200, 1400, 1600, 1800, 2000},
+		Values:     []float64{99, 99, 99, 99, 99, 99},
+	}}
+
+	// Store result for quantile 0.99.
+	rollupResultCacheV.PutSeries(nil, ec, expr99, window, tss99)
+
+	// Getting quantile 0.99 must hit.
+	gotTss, newStart := rollupResultCacheV.GetSeries(nil, ec, expr99, window)
+	if newStart == ec.Start {
+		t.Fatalf("expected cache hit for expr99 (newStart should be > ec.Start); got newStart=%d ec.Start=%d", newStart, ec.Start)
+	}
+	_ = gotTss
+
+	// Getting quantile 0.95 must miss — before commit 3e09d38f2 this would
+	// incorrectly hit the 0.99 entry.
+	_, newStart = rollupResultCacheV.GetSeries(nil, ec, expr95, window)
+	if newStart != ec.Start {
+		t.Fatalf("expected cache miss for expr95 (different quantile arg); got newStart=%d, want %d", newStart, ec.Start)
+	}
+}
+
+// TestRollupResultCacheCacheTagFiltersKey verifies that two queries that differ
+// only in their CacheTagFilters (extra_filters / tenant labels) produce
+// separate cache entries.
+//
+// Before commit f9015da6e (include extra_filters in rollupCache key for
+// multi-tenant support, fixes issue #9001) CacheTagFilters were not included
+// in the cache key, so queries from different tenants could incorrectly share
+// cached results, leaking data across tenant boundaries.
+func TestRollupResultCacheCacheTagFiltersKey(t *testing.T) {
+	InitRollupResultCache("")
+	defer StopRollupResultCache()
+	ResetRollupResultCache()
+
+	ec := &EvalConfig{
+		Start:              1000,
+		End:                2000,
+		Step:               200,
+		MaxPointsPerSeries: 1e4,
+		MayCache:           true,
+	}
+	window := int64(500)
+	expr := &metricsql.FuncExpr{
+		Name: "rate",
+		Args: []metricsql.Expr{
+			&metricsql.MetricExpr{
+				LabelFilterss: [][]metricsql.LabelFilter{{{Label: "__name__", Value: "requests"}}},
+			},
+		},
+	}
+
+	tenant1Filters := [][]storage.TagFilter{{{Key: []byte("vm_account_id"), Value: []byte("1")}}}
+	tenant2Filters := [][]storage.TagFilter{{{Key: []byte("vm_account_id"), Value: []byte("2")}}}
+
+	ecTenant1 := *ec
+	ecTenant1.CacheTagFilters = tenant1Filters
+	ecTenant2 := *ec
+	ecTenant2.CacheTagFilters = tenant2Filters
+
+	tssTenant1 := []*timeseries{{
+		Timestamps: []int64{1000, 1200, 1400, 1600, 1800, 2000},
+		Values:     []float64{1, 1, 1, 1, 1, 1},
+	}}
+
+	// Cache result for tenant 1.
+	rollupResultCacheV.PutSeries(nil, &ecTenant1, expr, window, tssTenant1)
+
+	// Getting with tenant 1 filters must hit.
+	_, newStart := rollupResultCacheV.GetSeries(nil, &ecTenant1, expr, window)
+	if newStart == ec.Start {
+		t.Fatalf("expected cache hit for tenant1; got newStart=%d ec.Start=%d", newStart, ec.Start)
+	}
+
+	// Getting with tenant 2 filters must miss — before commit f9015da6e this
+	// would incorrectly return tenant 1's data.
+	_, newStart = rollupResultCacheV.GetSeries(nil, &ecTenant2, expr, window)
+	if newStart != ec.Start {
+		t.Fatalf("expected cache miss for tenant2 (different CacheTagFilters); got newStart=%d, want %d", newStart, ec.Start)
+	}
+}
+
+// TestRollupResultCacheInitStopWithDisableCache verifies that cycling
+// InitRollupResultCache / StopRollupResultCache does not panic when the
+// -search.disableCache flag is set.
+//
+// Before commit 90a4b00b1 (fix panic on -search.disableCache),
+// InitRollupResultCache called c.Stop() on the internal cache when
+// disableCache=true, but did not set c to nil.  StopRollupResultCache then
+// called c.Stop() a second time, which panicked because the cache's stop
+// channel had already been closed.
+func TestRollupResultCacheInitStopWithDisableCache(t *testing.T) {
+	old := *disableCache
+	*disableCache = true
+	defer func() { *disableCache = old }()
+
+	// Must not panic.
+	for range 3 {
+		InitRollupResultCache("")
+		StopRollupResultCache()
+	}
+}
+
 func TestMergeSeries(t *testing.T) {
 	ec := &EvalConfig{
 		Start:              1000,

@@ -680,6 +680,89 @@ func TestSetBigGetBigStatsInWholeMode_cacheLoadedFromNonEmptyFile(t *testing.T) 
 	})
 }
 
+// TestStatsByteSizeNonZeroAfterSet verifies that BytesSize reported by
+// UpdateStats is greater than zero after entries have been added to the cache.
+//
+// Before commit 04c24fc83 (fix bytesSize metric calculation, follow-up for
+// 3e6fc445a) BytesSize could be reported incorrectly due to a bug in how the
+// metric was derived from prev and curr caches during UpdateStats.
+func TestStatsByteSizeNonZeroAfterSet(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := New(1024 * 1024)
+		defer c.Stop()
+
+		c.Set([]byte("key1"), []byte("value1"))
+		c.Set([]byte("key2"), []byte("value2"))
+
+		var s fastcache.Stats
+		c.UpdateStats(&s)
+		if s.BytesSize == 0 {
+			t.Fatalf("BytesSize must be > 0 after Set; got 0")
+		}
+		if s.MaxBytesSize == 0 {
+			t.Fatalf("MaxBytesSize must be > 0; got 0")
+		}
+
+		// BytesSize must remain > 0 after a rotation (entries move to prev).
+		// Before commit 04c24fc83, BytesSize could become 0 here because only
+		// curr was counted.
+		time.Sleep(*cacheExpireDuration + time.Minute)
+		synctest.Wait()
+
+		s = fastcache.Stats{}
+		c.UpdateStats(&s)
+		if s.BytesSize == 0 {
+			t.Fatalf("BytesSize must remain > 0 after rotation (entries are in prev); got 0")
+		}
+	})
+}
+
+// TestStatsCountersNeverDecreaseAfterRotation verifies that cumulative
+// GetCalls, SetCalls and Misses counters never decrease after a cache rotation.
+//
+// Before commit f0b08dbd9 (accumulate stat counters on cache rotation) the
+// stats were read directly from the live prev/curr fastcache instances.  When
+// curr was reset during rotation, all its counters reset to zero, which made
+// the aggregate values drop — corrupting the cache-hit-ratio Grafana panel
+// that uses rate(vm_cache_misses_total) / rate(vm_cache_requests_total).
+func TestStatsCountersNeverDecreaseAfterRotation(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		c := New(1024 * 1024)
+		defer c.Stop()
+
+		key := []byte("k")
+		val := []byte("v")
+		absent := []byte("absent")
+
+		c.Set(key, val)
+		c.Get(nil, key)    // hit  → GetCalls+1
+		c.Get(nil, absent) // miss → GetCalls+1, Misses+1
+
+		var before fastcache.Stats
+		c.UpdateStats(&before)
+		if before.GetCalls == 0 {
+			t.Fatalf("expected GetCalls > 0 before rotation")
+		}
+
+		// Rotate: curr becomes prev, new empty cache becomes curr.
+		time.Sleep(*cacheExpireDuration + time.Minute)
+		synctest.Wait()
+
+		var after fastcache.Stats
+		c.UpdateStats(&after)
+
+		if after.GetCalls < before.GetCalls {
+			t.Fatalf("GetCalls decreased after rotation: before=%d after=%d", before.GetCalls, after.GetCalls)
+		}
+		if after.SetCalls < before.SetCalls {
+			t.Fatalf("SetCalls decreased after rotation: before=%d after=%d", before.SetCalls, after.SetCalls)
+		}
+		if after.Misses < before.Misses {
+			t.Fatalf("Misses decreased after rotation: before=%d after=%d", before.Misses, after.Misses)
+		}
+	})
+}
+
 // assertMode checks that the cache mode matches the expected one.
 func assertMode(t *testing.T, c *Cache, want uint32) {
 	t.Helper()

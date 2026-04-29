@@ -130,6 +130,55 @@ func TestDateMetricIDCacheIsConsistent(_ *testing.T) {
 	wg.Wait()
 }
 
+// TestDateMetricIDCacheStatsIncludesMutablePart verifies that Stats().Size
+// accounts for entries that have been Set() but not yet synced from the mutable
+// "next" map into the immutable "curr" map.
+//
+// Before commit dc5d7aa4c (properly report dateMetricIDCache stats, fixes
+// issue #10064) Stats() only reported entries in the immutable part.  Entries
+// in the mutable "next" part were invisible until the next sync, which could
+// make the cache appear empty even when it held thousands of entries, giving
+// misleading vm_cache_entries and vm_cache_size_bytes metrics.
+func TestDateMetricIDCacheStatsIncludesMutablePart(t *testing.T) {
+	dmc := newDateMetricIDCache()
+	defer dmc.MustStop()
+
+	const (
+		date     = 12345
+		n        = 1000
+		firstID  = uint64(0)
+	)
+
+	// Add entries; they land in the mutable "next" map, not yet in "curr".
+	for i := range uint64(n) {
+		dmc.Set(date, firstID+i)
+	}
+
+	// Stats must immediately reflect all entries, not just the immutable part.
+	stats := dmc.Stats()
+	if stats.Size < n {
+		t.Fatalf("Stats().Size should be >= %d immediately after Set(); got %d — mutable part is not being counted", n, stats.Size)
+	}
+}
+
+// TestDateMetricIDCacheRotationPeriodAtLeastOneHour verifies that the shard
+// rotation period is at least 30 minutes.
+//
+// Commit cd2e11b7c (increase rotation time for daily metricID cache, fixes
+// issue #10064) raised the rotation period from 10 minutes to 1 hour because
+// the short rotation caused index pre-created for the next day to fall out of
+// cache before midnight, resulting in CPU spikes.  This test guards against
+// a regression back to the old 10-minute (or shorter) period.
+func TestDateMetricIDCacheRotationPeriodAtLeastOneHour(t *testing.T) {
+	dmc := newDateMetricIDCache()
+	defer dmc.MustStop()
+
+	const minPeriod = 30 * time.Minute
+	if dmc.rotationPeriod < minPeriod {
+		t.Fatalf("rotationPeriod is %v; want >= %v — regression from cd2e11b7c which raised it to 1h to avoid midnight CPU spikes (issue #10064)", dmc.rotationPeriod, minPeriod)
+	}
+}
+
 func TestDateMetricIDCache_Size(t *testing.T) {
 	dmc := newDateMetricIDCache()
 	defer dmc.MustStop()
