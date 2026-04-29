@@ -245,10 +245,19 @@ func (c *cache) RemoveBlocksForPart(p any) {
 	for _, e := range c.m[p] {
 		sizeBytes += e.b.SizeBytes()
 		heap.Remove(&c.lah, e.heapIdx)
-		// do not delete the entry from c.perKeyMisses, since it is removed by cache.cleaner later.
 	}
 	c.updateSizeBytes(-sizeBytes)
 	delete(c.m, p)
+
+	// Remove perKeyMisses entries for the closed part so the part pointer is
+	// not retained in memory longer than necessary.  Without this, the part
+	// struct (and its file descriptors) would be kept reachable by the GC
+	// until the next cleanPerKeyMisses tick (~3 minutes).
+	for k := range c.perKeyMisses {
+		if k.Part == p {
+			delete(c.perKeyMisses, k)
+		}
+	}
 }
 
 func (c *cache) updateSizeBytes(n int) {
@@ -257,7 +266,25 @@ func (c *cache) updateSizeBytes(n int) {
 
 func (c *cache) cleanPerKeyMisses() {
 	c.mu.Lock()
-	c.perKeyMisses = make(map[Key]int, len(c.perKeyMisses))
+	// Rebuild the map keeping only entries that are actively accumulating
+	// misses toward the caching threshold (0 < misses <= missesBeforeCaching).
+	// Entries that already resulted in a cache put (misses == 0, set by
+	// TryPutBlock after caching) are dropped because they are no longer
+	// needed: the next GetBlock miss for such a key will simply restart the
+	// counter from 1, which is the correct behaviour.
+	//
+	// Previously this function replaced the map unconditionally, which caused
+	// pending miss counts to be lost.  A block accessed once every ~2 minutes
+	// would never accumulate the required number of consecutive misses before
+	// the ~3-minute reset, so it was never admitted to the cache.
+	newMap := make(map[Key]int, len(c.perKeyMisses))
+	threshold := *missesBeforeCaching
+	for k, misses := range c.perKeyMisses {
+		if misses > 0 && misses <= threshold {
+			newMap[k] = misses
+		}
+	}
+	c.perKeyMisses = newMap
 	c.mu.Unlock()
 }
 

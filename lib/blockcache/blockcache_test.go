@@ -123,6 +123,73 @@ func TestCache(t *testing.T) {
 	}
 }
 
+// TestCachePeriodicAccessNeverCached verifies that a block accessed regularly
+// at intervals longer than the cleanPerKeyMisses period eventually gets cached.
+//
+// Each "access" below is a GetBlock+TryPutBlock pair, exactly as the callers
+// in part_search.go do: read from disk when GetBlock misses, then offer the
+// result back to the cache via TryPutBlock.
+//
+// With the bug, cleanPerKeyMisses resets the perKeyMisses counter to zero
+// unconditionally.  A block accessed slower than missesBeforeCaching+1 times
+// per 3-minute window (the default) therefore never reaches the caching
+// threshold and is re-read from disk on every single access forever.
+func TestCachePeriodicAccessNeverCached(t *testing.T) {
+	sizeMaxBytes := 64 * 1024
+	cpus := cgroup.AvailableCPUs()
+	sizeMaxBytes *= cpus * cpus
+
+	c := NewCache(func() int { return sizeMaxBytes })
+	defer c.MustStop()
+
+	part := (any)("testpart")
+	k := Key{Part: part, Offset: 42}
+	b := &testBlock{}
+
+	// access is the helper that simulates one "read-and-try-cache" cycle.
+	// It returns true when the block was found in cache (cache hit).
+	access := func() bool {
+		got := c.GetBlock(k)
+		if got != nil {
+			return true
+		}
+		c.TryPutBlock(k, b)
+		return false
+	}
+
+	// Access 1: first miss, counter → 1, not cached.
+	if access() {
+		t.Fatal("block must not be in cache on first access")
+	}
+
+	// Simulate the background cleanPerKeyMisses timer firing between accesses.
+	// Bug: this wipes the counter back to zero, so the next TryPutBlock sees
+	// misses == 1 again instead of 2, and the block is never admitted.
+	c.cleanPerKeyMisses()
+
+	// Access 2: after the reset the bug restarts the counter at 1; the fix
+	// preserves it at 1 from before the reset and increments it to 2.
+	if access() {
+		t.Fatal("block must not be in cache yet after second access")
+	}
+
+	// Access 3: GetBlock still misses (block not in cache yet), then TryPutBlock
+	// is called with the freshly read block.
+	//   buggy path – counter is 2 (reset+1+1), still ≤ missesBeforeCaching, NOT admitted.
+	//   fixed path – counter is 3 (preserved 1 + 2 increments), > missesBeforeCaching, ADMITTED.
+	access()
+
+	// After access 3, with the fix TryPutBlock has admitted the block to the
+	// cache, so the very next GetBlock must be a hit.
+	// With the bug the counter was reset by cleanPerKeyMisses, so the block
+	// was never admitted and this GetBlock returns nil.
+	if got := c.GetBlock(k); got == nil {
+		t.Fatalf("block must be cached after %d misses spread across a cleanPerKeyMisses call; "+
+			"cleanPerKeyMisses must not discard pending miss counts for active blocks",
+			*missesBeforeCaching+1)
+	}
+}
+
 func TestCacheConcurrentAccess(_ *testing.T) {
 	const sizeMaxBytes = 16 * 1024 * 1024
 	getMaxSize := func() int {
