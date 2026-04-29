@@ -13,6 +13,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/auth"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/chunkedbuffer"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prommetadata"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
@@ -1132,4 +1133,123 @@ func mustParseRelabelConfigs(config string) *promrelabel.ParsedConfigs {
 		panic(fmt.Errorf("cannot parse %q: %w", config, err))
 	}
 	return pcs
+}
+
+// TestScrapeWorkLastScrapeOnlyUpdatedOnSuccess verifies that
+// processDataOneShot updates the stored last-scrape body only when the current
+// scrape succeeds (err == nil), and that stale markers for disappeared metrics
+// are sent correctly even when a failed scrape lies between two successful ones.
+//
+// Before commit 0a256002e (lib/promscrape: update last scrape result only when
+// current scrape is successful, fixes issue #10653), the last-scrape body was
+// unconditionally overwritten with an empty string on any failed scrape.  This
+// caused two problems:
+//
+//  1. After a failed scrape, the stored last-scrape body became "", so a
+//     subsequent successful scrape would compare against "" and treat all
+//     metrics as new — stale markers for metrics that had genuinely disappeared
+//     before the failure were never sent.
+//
+//  2. scrape_series_added could be inflated because the diff was computed
+//     against an empty last-scrape rather than the previous successful one.
+//
+// The fix tracks lastScrapeSuccess and only calls storeLastScrape when err==nil.
+func TestScrapeWorkLastScrapeOnlyUpdatedOnSuccess(t *testing.T) {
+	protoparserutil.StartUnmarshalWorkers()
+	defer protoparserutil.StopUnmarshalWorkers()
+
+	timestamp := int64(1000000) // 1 s in ms
+
+	// Helper: run a single one-shot scrape and collect pushed timeseries.
+	type scrapeResult struct {
+		timeseries []*prompb.TimeSeries
+		err        error
+	}
+	doScrape := func(sw *scrapeWork, body string, shouldFail bool) scrapeResult {
+		t.Helper()
+		var pushed []*prompb.TimeSeries
+		sw.PushData = func(_ *auth.Token, wr *prompb.WriteRequest) {
+			for i := range wr.Timeseries {
+				ts := wr.Timeseries[i]
+				pushed = append(pushed, &ts)
+			}
+		}
+		if shouldFail {
+			sw.ReadData = func(_ *chunkedbuffer.Buffer) (bool, error) {
+				return false, fmt.Errorf("simulated scrape failure")
+			}
+		} else {
+			sw.ReadData = func(dst *chunkedbuffer.Buffer) (bool, error) {
+				dst.MustWrite([]byte(body))
+				return false, nil
+			}
+		}
+		tsmGlobal.Register(sw)
+		err := sw.scrapeInternal(timestamp, timestamp)
+		tsmGlobal.Unregister(sw)
+		return scrapeResult{timeseries: pushed, err: err}
+	}
+
+	// Count how many stale-marker samples are present in a slice of timeseries.
+	countStaleMarkers := func(tss []*prompb.TimeSeries) int {
+		n := 0
+		for _, ts := range tss {
+			for _, s := range ts.Samples {
+				if decimal.IsStaleNaN(s.Value) {
+					n++
+				}
+			}
+		}
+		return n
+	}
+
+	sw := &scrapeWork{
+		Config: &ScrapeWork{
+			ScrapeTimeout: time.Second * 5,
+			NoStaleMarkers: false,
+		},
+	}
+
+	// Scrape 1 (success): report metric_a and metric_b.
+	body1 := "metric_a 1\nmetric_b 2\n"
+	r1 := doScrape(sw, body1, false)
+	if r1.err != nil {
+		t.Fatalf("scrape 1 unexpected error: %v", r1.err)
+	}
+	if !sw.lastScrapeSuccess {
+		t.Fatal("scrape 1: lastScrapeSuccess should be true after successful scrape")
+	}
+
+	// Scrape 2 (failure): network error.
+	// lastScrapeSuccess must become false; lastScrape body must NOT change.
+	r2 := doScrape(sw, "", true)
+	if r2.err == nil {
+		t.Fatal("scrape 2: expected error for failed scrape; got nil")
+	}
+	if sw.lastScrapeSuccess {
+		t.Fatal("scrape 2: lastScrapeSuccess should be false after failed scrape")
+	}
+
+	// Verify stored last scrape still contains the body from scrape 1 (not empty).
+	var loadedBuf []byte
+	loadedBuf = sw.loadLastScrape(loadedBuf)
+	if len(loadedBuf) == 0 {
+		t.Fatal("scrape 2: last scrape body must NOT be cleared on failure " +
+			"(regression of commit 0a256002e, issue #10653)")
+	}
+
+	// Scrape 3 (success): report only metric_b (metric_a disappeared).
+	// Stale marker for metric_a must be sent because the diff is computed
+	// against the *last successful* scrape (which had metric_a).
+	body3 := "metric_b 3\n"
+	r3 := doScrape(sw, body3, false)
+	if r3.err != nil {
+		t.Fatalf("scrape 3 unexpected error: %v", r3.err)
+	}
+	staleCount := countStaleMarkers(r3.timeseries)
+	if staleCount == 0 {
+		t.Fatal("scrape 3: expected at least one stale marker for metric_a which disappeared; " +
+			"got 0 — last scrape body was likely overwritten by the failed scrape 2 " +
+			"(regression of commit 0a256002e, issue #10653)")
+	}
 }

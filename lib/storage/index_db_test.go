@@ -1936,6 +1936,92 @@ func TestSearchTSIDWithTimeRange(t *testing.T) {
 	fs.MustRemoveDir(path)
 }
 
+// TestIndexDBUpdateMetricsSetsStatsForEmptyCache verifies that UpdateMetrics
+// populates cache gauge fields (SizeMaxBytes) even when all indexDB instances
+// have zero SizeBytes for their tagFiltersToMetricIDsCache.
+//
+// Before commit f0b251d96 (lib/storage: fix per-idb cache stats, follow-up
+// #10204) the condition to elect the "dominant" indexDB was:
+//
+//	db.tagFiltersToMetricIDsCache.SizeBytes() > m.TagFiltersToMetricIDsCacheSizeBytes
+//
+// When both sides are 0 the condition is false for every instance, so
+// SizeMaxBytes was never written to m.  The fix adds an
+// "m.TagFiltersToMetricIDsCacheSizeBytes == 0 ||" guard so that the first-met
+// indexDB always initialises the gauges regardless of whether the cache holds
+// any entries.
+func TestIndexDBUpdateMetricsSetsStatsForEmptyCache(t *testing.T) {
+	defer testRemoveAll(t)
+
+	s := MustOpenStorage(filepath.Join(t.Name(), "storage"), OpenOptions{})
+	defer s.MustClose()
+
+	// Open two independent indexDB instances so that UpdateMetrics is called
+	// for each in sequence (simulating the production code path in
+	// Storage.UpdateMetrics).
+	var readOnly1, readOnly2 atomic.Bool
+	db1 := mustOpenIndexDB(1, TimeRange{}, "db1", filepath.Join(t.Name(), "db1"), s, &readOnly1, true)
+	defer db1.MustClose()
+	db2 := mustOpenIndexDB(2, TimeRange{}, "db2", filepath.Join(t.Name(), "db2"), s, &readOnly2, true)
+	defer db2.MustClose()
+
+	// Both caches are empty (SizeBytes == 0).  UpdateMetrics must still report
+	// a non-zero SizeMaxBytes from the configured cache capacity.
+	var m IndexDBMetrics
+	db1.UpdateMetrics(&m)
+	db2.UpdateMetrics(&m)
+
+	if m.TagFiltersToMetricIDsCacheSizeMaxBytes == 0 {
+		t.Fatal("TagFiltersToMetricIDsCacheSizeMaxBytes is 0 after UpdateMetrics on two empty-cache indexDB instances; " +
+			"the first-met-instance guard is missing (regression of commit f0b251d96)")
+	}
+}
+
+// TestIndexDBUpdateMetricsAccumulatesRequestsAcrossInstances verifies that the
+// TagFiltersToMetricIDsCacheRequests counter is summed across all indexDB
+// instances, not capped at the max-SizeBytes instance.
+//
+// Before commit ab1429c89 (lib/storage: fix tagFiltersCache stats collection,
+// #10230) the election guard compared SizeBytes==0 as the "is this the first
+// instance?" indicator.  Because tagFiltersToMetricIDsCache is reset often,
+// SizeBytes is frequently zero, causing the guard to be unreliable — later
+// instances could silently overwrite gauges already set by the first.  The fix
+// changed the guard to use TagFiltersToMetricIDsCacheRequests==0 instead, which
+// is a monotonically-increasing counter that never resets.
+func TestIndexDBUpdateMetricsAccumulatesRequestsAcrossInstances(t *testing.T) {
+	defer testRemoveAll(t)
+
+	s := MustOpenStorage(filepath.Join(t.Name(), "storage"), OpenOptions{})
+	defer s.MustClose()
+
+	var readOnly1, readOnly2 atomic.Bool
+	db1 := mustOpenIndexDB(1, TimeRange{}, "db1", filepath.Join(t.Name(), "db1"), s, &readOnly1, true)
+	defer db1.MustClose()
+	db2 := mustOpenIndexDB(2, TimeRange{}, "db2", filepath.Join(t.Name(), "db2"), s, &readOnly2, true)
+	defer db2.MustClose()
+
+	// Collect stats from db1 alone, then from both.
+	var m1 IndexDBMetrics
+	db1.UpdateMetrics(&m1)
+
+	var m2 IndexDBMetrics
+	db1.UpdateMetrics(&m2)
+	db2.UpdateMetrics(&m2)
+
+	// TagFiltersToMetricIDsCacheRequests must be the SUM across all instances,
+	// not the max.  Calling db1 twice and db2 once must yield at least
+	// 2×(db1 contribution).
+	if m2.TagFiltersToMetricIDsCacheRequests < 2*m1.TagFiltersToMetricIDsCacheRequests {
+		t.Fatalf(
+			"TagFiltersToMetricIDsCacheRequests not accumulated across instances: "+
+				"got %d for 2×db1+db2, want >= 2×%d "+
+				"(regression of commit ab1429c89, #10230)",
+			m2.TagFiltersToMetricIDsCacheRequests,
+			m1.TagFiltersToMetricIDsCacheRequests,
+		)
+	}
+}
+
 func toTFPointers(tfs []tagFilter) []*tagFilter {
 	tfps := make([]*tagFilter, len(tfs))
 	for i := range tfs {
