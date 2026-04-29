@@ -763,6 +763,59 @@ func TestStatsCountersNeverDecreaseAfterRotation(t *testing.T) {
 	})
 }
 
+// TestResetRestoresSplitModeAndWorkers verifies that Reset() on a cache that
+// has transitioned to modeSwitching brings it back to modeSplit and that the
+// background expiration workers continue operating after the reset.
+//
+// Before commit cea9505ba (properly transit cache state, PR #9769) a Reset()
+// called while the cache was in modeSwitching left background workers in a
+// broken state: expirationWatcher returned instead of continuing, so entries
+// were never rotated out and the cache could not transition modes again.
+func TestResetRestoresSplitModeAndWorkers(t *testing.T) {
+	const (
+		cacheSize            = 256 * 1024 * 1024
+		cacheSizeCheckInterv = 2 * time.Second // cacheSizeWatcher fires every ~1.5 s
+	)
+	synctest.Test(t, func(t *testing.T) {
+		c := New(cacheSize)
+		defer c.Stop()
+		assertMode(t, c, modeSplit)
+
+		// Fill curr to >90 % using the same parameters as TestCacheModeTransition.
+		baseKey := make([]byte, 8096)
+		value := make([]byte, 12096)
+		for i := range 12096 {
+			key := append(baseKey[:len(baseKey):len(baseKey)], fmt.Sprintf("idx_%d", i)...)
+			c.Set(key, value)
+		}
+		time.Sleep(cacheSizeCheckInterv)
+		synctest.Wait()
+		if c.mode.Load() == modeSplit {
+			t.Fatal("cache must leave modeSplit after filling to >90 %; cacheSizeWatcher may not be running")
+		}
+
+		// Reset must bring us back to modeSplit.
+		c.Reset()
+		assertMode(t, c, modeSplit)
+
+		// Confirm the expiration watcher is still alive by setting a canary key
+		// and watching it rotate out over two expiration periods.
+		canary := []byte("canary")
+		c.Set(canary, []byte("v"))
+
+		time.Sleep(*cacheExpireDuration + time.Minute)
+		synctest.Wait()
+		// Key is now in prev; one more rotation evicts it entirely.
+		time.Sleep(*cacheExpireDuration + time.Minute)
+		synctest.Wait()
+
+		if got := c.Get(nil, canary); got != nil {
+			t.Fatal("canary key must be evicted after two rotation periods; " +
+				"expirationWatcher may have stopped (regression of commit cea9505ba)")
+		}
+	})
+}
+
 // assertMode checks that the cache mode matches the expected one.
 func assertMode(t *testing.T, c *Cache, want uint32) {
 	t.Helper()

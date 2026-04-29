@@ -179,6 +179,33 @@ func TestDateMetricIDCacheRotationPeriodAtLeastOneHour(t *testing.T) {
 	}
 }
 
+// TestDateMetricIDCacheStatsSizeBytesNonZero verifies that Stats().SizeBytes
+// is greater than zero after entries have been added and synced into the
+// immutable "curr" map.
+//
+// Commit dc5d7aa4c (properly report dateMetricIDCache stats, issue #10064)
+// fixed Stats() to report SizeBytes for both mutable and immutable parts.
+// Before that fix, SizeBytes was always 0 until entries were synced, giving
+// misleading utilisation metrics.
+func TestDateMetricIDCacheStatsSizeBytesNonZero(t *testing.T) {
+	dmc := newDateMetricIDCache()
+	defer dmc.MustStop()
+
+	const (
+		date     = 99999
+		n        = 500
+	)
+
+	for i := range uint64(n) {
+		dmc.Set(date, i)
+	}
+
+	stats := dmc.Stats()
+	if stats.SizeBytes == 0 {
+		t.Fatalf("Stats().SizeBytes must be > 0 after Set(); got 0 — mutable part SizeBytes is not being counted (regression of dc5d7aa4c)")
+	}
+}
+
 func TestDateMetricIDCache_Size(t *testing.T) {
 	dmc := newDateMetricIDCache()
 	defer dmc.MustStop()

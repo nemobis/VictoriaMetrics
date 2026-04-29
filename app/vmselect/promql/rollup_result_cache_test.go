@@ -462,6 +462,59 @@ func TestRollupResultCacheInitStopWithDisableCache(t *testing.T) {
 	}
 }
 
+// TestResetRollupResultCacheInvalidatesEntries verifies that calling
+// ResetRollupResultCache() makes previously cached entries inaccessible without
+// physically wiping the underlying cache storage.
+//
+// Commit 92531a38c changed ResetRollupResultCache() from calling c.Reset()
+// (which is slow and causes a temporary performance hit) to incrementing an
+// in-key prefix counter so that all old keys become invisible instantly.
+// The correctness requirement is: after the reset a Get for the same expr/ec
+// must return a cache miss.
+func TestResetRollupResultCacheInvalidatesEntries(t *testing.T) {
+	InitRollupResultCache("")
+	defer StopRollupResultCache()
+	ResetRollupResultCache()
+
+	ec := &EvalConfig{
+		Start:              1000,
+		End:                2000,
+		Step:               200,
+		MaxPointsPerSeries: 1e4,
+		MayCache:           true,
+	}
+	window := int64(500)
+	expr := &metricsql.FuncExpr{
+		Name: "rate",
+		Args: []metricsql.Expr{
+			&metricsql.MetricExpr{
+				LabelFilterss: [][]metricsql.LabelFilter{{{Label: "__name__", Value: "rps"}}},
+			},
+		},
+	}
+	tss := []*timeseries{{
+		Timestamps: []int64{1000, 1200, 1400, 1600, 1800, 2000},
+		Values:     []float64{1, 2, 3, 4, 5, 6},
+	}}
+
+	rollupResultCacheV.PutSeries(nil, ec, expr, window, tss)
+
+	// Must hit before reset.
+	_, newStart := rollupResultCacheV.GetSeries(nil, ec, expr, window)
+	if newStart == ec.Start {
+		t.Fatalf("expected cache hit before reset; got miss (newStart=%d == ec.Start=%d)", newStart, ec.Start)
+	}
+
+	// After reset all entries must be invisible regardless of the underlying
+	// storage still containing them (prefix changed).
+	ResetRollupResultCache()
+
+	_, newStart = rollupResultCacheV.GetSeries(nil, ec, expr, window)
+	if newStart != ec.Start {
+		t.Fatalf("expected cache miss after ResetRollupResultCache(); got hit (newStart=%d, ec.Start=%d)", newStart, ec.Start)
+	}
+}
+
 func TestMergeSeries(t *testing.T) {
 	ec := &EvalConfig{
 		Start:              1000,
