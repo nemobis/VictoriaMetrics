@@ -64,6 +64,7 @@ func resetFlags() {
 // ---------------------------------------------------------------------------
 func TestInit_EmptyAddr(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 
 	qb, err := Init()
 	if err != nil {
@@ -82,6 +83,7 @@ func TestInit_EmptyAddr(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_ValidURL(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "http://127.0.0.1:8428"
 
 	qb, err := Init()
@@ -100,6 +102,7 @@ func TestInit_ValidURL(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_ValidHTTPSURL(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "https://victoria-metrics.example.com:8428"
 
 	qb, err := Init()
@@ -121,6 +124,7 @@ func TestInit_ValidHTTPSURL(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_InvalidURL(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	// A raw control character makes url.Parse return an error.
 	*addr = "http://\x00invalid"
 
@@ -141,6 +145,7 @@ func TestInit_InvalidURL(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_InvalidOAuth2EndpointParams(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "http://127.0.0.1:8428"
 	*oauth2EndpointParams = `{not valid json}`
 
@@ -160,6 +165,7 @@ func TestInit_InvalidOAuth2EndpointParams(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_ValidOAuth2EndpointParams(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "http://127.0.0.1:8428"
 	*oauth2EndpointParams = `{"audience":"https://example.com"}`
 
@@ -180,6 +186,7 @@ func TestInit_ValidOAuth2EndpointParams(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_EmptyOAuth2EndpointParams(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "http://127.0.0.1:8428"
 	*oauth2EndpointParams = ""
 
@@ -199,6 +206,7 @@ func TestInit_EmptyOAuth2EndpointParams(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_WithBasicAuth(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "http://127.0.0.1:8428"
 	*basicAuthUsername = "alice"
 	*basicAuthPassword = "s3cr3t"
@@ -219,6 +227,7 @@ func TestInit_WithBasicAuth(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_WithBearerToken(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "http://127.0.0.1:8428"
 	*bearerToken = "mytoken"
 
@@ -238,6 +247,7 @@ func TestInit_WithBearerToken(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_WithHeaders(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "http://127.0.0.1:8428"
 	*headers = "X-Custom-Header:value1^^X-Another:value2"
 
@@ -258,6 +268,7 @@ func TestInit_WithHeaders(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInit_TLSInsecureSkipVerify(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	*addr = "http://127.0.0.1:8428"
 	*tlsInsecureSkipVerify = true
 
@@ -280,6 +291,7 @@ func TestInit_TLSInsecureSkipVerify(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInitSecretFlags_HidesURL(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	flagutil.UnregisterAllSecretFlags()
 	t.Cleanup(flagutil.UnregisterAllSecretFlags)
 
@@ -304,6 +316,7 @@ func TestInitSecretFlags_HidesURL(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestInitSecretFlags_ShowsURL(t *testing.T) {
 	resetFlags()
+	t.Cleanup(resetFlags)
 	flagutil.UnregisterAllSecretFlags()
 	t.Cleanup(flagutil.UnregisterAllSecretFlags)
 

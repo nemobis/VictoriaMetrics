@@ -21,6 +21,10 @@ var (
 	rowsPerInsert      = metrics.NewHistogram(`vmagent_rows_per_insert{type="datadogv1"}`)
 )
 
+// insertRowsHook is called in tests to inspect the WriteRequest before the
+// push context is recycled.  It is nil in production.
+var insertRowsHook func(*prompb.WriteRequest)
+
 // InsertHandlerForHTTP processes remote write for DataDog POST /api/v1/series request.
 func InsertHandlerForHTTP(at *auth.Token, req *http.Request) error {
 	extraLabels, err := protoparserutil.GetExtraLabels(req)
@@ -87,6 +91,9 @@ func insertRows(at *auth.Token, series []datadogv1.Series, extraLabels []prompb.
 	ctx.WriteRequest.Timeseries = tssDst
 	ctx.Labels = labels
 	ctx.Samples = samples
+	if insertRowsHook != nil {
+		insertRowsHook(&ctx.WriteRequest)
+	}
 	if !remotewrite.TryPush(at, &ctx.WriteRequest) {
 		return remotewrite.ErrQueueFullHTTPRetry
 	}

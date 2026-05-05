@@ -262,6 +262,16 @@ func TestInsertRows_SingleSeriesWithPoints(t *testing.T) {
 }
 
 func TestInsertRows_HostAndDeviceFields(t *testing.T) {
+	var captured []prompb.Label
+	insertRowsHook = func(wr *prompb.WriteRequest) {
+		if len(wr.Timeseries) > 0 {
+			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
+			copy(lbls, wr.Timeseries[0].Labels)
+			captured = lbls
+		}
+	}
+	t.Cleanup(func() { insertRowsHook = nil })
+
 	series := []datadogv1.Series{
 		{
 			Metric: "disk.io",
@@ -273,9 +283,33 @@ func TestInsertRows_HostAndDeviceFields(t *testing.T) {
 	if err := insertRows(nil, series, nil); err != nil {
 		t.Fatalf("host/device fields returned unexpected error: %v", err)
 	}
+
+	labelMap := map[string]string{}
+	for _, l := range captured {
+		labelMap[l.Name] = l.Value
+	}
+	if labelMap["__name__"] != "disk.io" {
+		t.Errorf("__name__: got %q, want %q", labelMap["__name__"], "disk.io")
+	}
+	if labelMap["host"] != "web-01" {
+		t.Errorf("host: got %q, want %q", labelMap["host"], "web-01")
+	}
+	if labelMap["device"] != "/dev/sda1" {
+		t.Errorf("device: got %q, want %q", labelMap["device"], "/dev/sda1")
+	}
 }
 
 func TestInsertRows_TagSplitting(t *testing.T) {
+	var captured []prompb.Label
+	insertRowsHook = func(wr *prompb.WriteRequest) {
+		if len(wr.Timeseries) > 0 {
+			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
+			copy(lbls, wr.Timeseries[0].Labels)
+			captured = lbls
+		}
+	}
+	t.Cleanup(func() { insertRowsHook = nil })
+
 	series := []datadogv1.Series{
 		{
 			Metric: "system.load.1",
@@ -286,11 +320,36 @@ func TestInsertRows_TagSplitting(t *testing.T) {
 	if err := insertRows(nil, series, nil); err != nil {
 		t.Fatalf("tag splitting returned unexpected error: %v", err)
 	}
+
+	labelMap := map[string]string{}
+	for _, l := range captured {
+		labelMap[l.Name] = l.Value
+	}
+	if labelMap["env"] != "prod" {
+		t.Errorf("env: got %q, want %q", labelMap["env"], "prod")
+	}
+	if labelMap["region"] != "us-east-1" {
+		t.Errorf("region: got %q, want %q", labelMap["region"], "us-east-1")
+	}
+	// A tag with no ":" separator produces an empty value.
+	if _, ok := labelMap["notag"]; !ok {
+		t.Errorf("expected label 'notag' to be present (split with empty value)")
+	}
 }
 
 func TestInsertRows_HostTagRenamedToExportedHost(t *testing.T) {
-	// A "host" tag in Tags should be renamed to "exported_host" to avoid
-	// collision with the top-level Host field.
+	// A "host" tag in Tags must be renamed to "exported_host" to avoid
+	// collision with the top-level Host field (verified via insertRowsHook).
+	var captured []prompb.Label
+	insertRowsHook = func(wr *prompb.WriteRequest) {
+		if len(wr.Timeseries) > 0 {
+			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
+			copy(lbls, wr.Timeseries[0].Labels)
+			captured = lbls
+		}
+	}
+	t.Cleanup(func() { insertRowsHook = nil })
+
 	series := []datadogv1.Series{
 		{
 			Metric: "system.mem.used",
@@ -302,9 +361,42 @@ func TestInsertRows_HostTagRenamedToExportedHost(t *testing.T) {
 	if err := insertRows(nil, series, nil); err != nil {
 		t.Fatalf("host tag rename returned unexpected error: %v", err)
 	}
+
+	labelMap := map[string]string{}
+	for _, l := range captured {
+		labelMap[l.Name] = l.Value
+	}
+	// Top-level Host field must appear as "host".
+	if labelMap["host"] != "real-host" {
+		t.Errorf("host: got %q, want %q", labelMap["host"], "real-host")
+	}
+	// Tags["host:tag-host"] must be renamed to "exported_host".
+	if labelMap["exported_host"] != "tag-host" {
+		t.Errorf("exported_host: got %q, want %q", labelMap["exported_host"], "tag-host")
+	}
+	// The raw "host" key from Tags must NOT appear twice (it was renamed).
+	count := 0
+	for _, l := range captured {
+		if l.Name == "host" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("expected exactly one 'host' label (from Host field), got %d", count)
+	}
 }
 
 func TestInsertRows_ExtraLabels(t *testing.T) {
+	var captured []prompb.Label
+	insertRowsHook = func(wr *prompb.WriteRequest) {
+		if len(wr.Timeseries) > 0 {
+			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
+			copy(lbls, wr.Timeseries[0].Labels)
+			captured = lbls
+		}
+	}
+	t.Cleanup(func() { insertRowsHook = nil })
+
 	series := []datadogv1.Series{
 		{
 			Metric: "custom.metric",
@@ -317,6 +409,17 @@ func TestInsertRows_ExtraLabels(t *testing.T) {
 	}
 	if err := insertRows(nil, series, extraLabels); err != nil {
 		t.Fatalf("extra labels returned unexpected error: %v", err)
+	}
+
+	labelMap := map[string]string{}
+	for _, l := range captured {
+		labelMap[l.Name] = l.Value
+	}
+	if labelMap["datacenter"] != "dc1" {
+		t.Errorf("datacenter: got %q, want %q", labelMap["datacenter"], "dc1")
+	}
+	if labelMap["team"] != "ops" {
+		t.Errorf("team: got %q, want %q", labelMap["team"], "ops")
 	}
 }
 

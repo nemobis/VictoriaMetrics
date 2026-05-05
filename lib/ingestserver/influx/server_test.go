@@ -48,11 +48,16 @@ func TestMain(m *testing.M) {
 		if strings.HasPrefix(payload, "udp.") {
 			select {
 			case sharedUDPPayloads <- payload:
+			// default: silently drop when channel is full.  Safe because each
+			// test holds serialMu and calls drainChan() before sending, so the
+			// channel is always empty at test start.  Dropping prevents this
+			// goroutine from blocking when a test leaves unread items behind.
 			default:
 			}
 		} else {
 			select {
 			case sharedTCPPayloads <- payload:
+			// default: same rationale as the UDP branch above.
 			default:
 			}
 		}
