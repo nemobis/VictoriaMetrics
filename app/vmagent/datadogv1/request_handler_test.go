@@ -73,6 +73,32 @@ func gzipV1(t *testing.T, s string) *bytes.Buffer {
 	return &buf
 }
 
+// captureFirstSeriesLabels installs insertRowsHook to capture a copy of the
+// labels from the first TimeSeries in the WriteRequest.  The hook is cleared
+// via t.Cleanup.  Call the returned getter after insertRows to retrieve them.
+func captureFirstSeriesLabels(t *testing.T) func() []prompb.Label {
+	t.Helper()
+	var captured []prompb.Label
+	insertRowsHook = func(wr *prompb.WriteRequest) {
+		if len(wr.Timeseries) > 0 {
+			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
+			copy(lbls, wr.Timeseries[0].Labels)
+			captured = lbls
+		}
+	}
+	t.Cleanup(func() { insertRowsHook = nil })
+	return func() []prompb.Label { return captured }
+}
+
+// toLabelMap converts a label slice to a name→value map for easy assertion.
+func toLabelMap(labels []prompb.Label) map[string]string {
+	m := make(map[string]string, len(labels))
+	for _, l := range labels {
+		m[l.Name] = l.Value
+	}
+	return m
+}
+
 const validV1Body = `{
 	"series": [
 		{
@@ -262,15 +288,7 @@ func TestInsertRows_SingleSeriesWithPoints(t *testing.T) {
 }
 
 func TestInsertRows_HostAndDeviceFields(t *testing.T) {
-	var captured []prompb.Label
-	insertRowsHook = func(wr *prompb.WriteRequest) {
-		if len(wr.Timeseries) > 0 {
-			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
-			copy(lbls, wr.Timeseries[0].Labels)
-			captured = lbls
-		}
-	}
-	t.Cleanup(func() { insertRowsHook = nil })
+	getLabels := captureFirstSeriesLabels(t)
 
 	series := []datadogv1.Series{
 		{
@@ -284,31 +302,20 @@ func TestInsertRows_HostAndDeviceFields(t *testing.T) {
 		t.Fatalf("host/device fields returned unexpected error: %v", err)
 	}
 
-	labelMap := map[string]string{}
-	for _, l := range captured {
-		labelMap[l.Name] = l.Value
+	got := toLabelMap(getLabels())
+	if got["__name__"] != "disk.io" {
+		t.Errorf("__name__: got %q, want %q", got["__name__"], "disk.io")
 	}
-	if labelMap["__name__"] != "disk.io" {
-		t.Errorf("__name__: got %q, want %q", labelMap["__name__"], "disk.io")
+	if got["host"] != "web-01" {
+		t.Errorf("host: got %q, want %q", got["host"], "web-01")
 	}
-	if labelMap["host"] != "web-01" {
-		t.Errorf("host: got %q, want %q", labelMap["host"], "web-01")
-	}
-	if labelMap["device"] != "/dev/sda1" {
-		t.Errorf("device: got %q, want %q", labelMap["device"], "/dev/sda1")
+	if got["device"] != "/dev/sda1" {
+		t.Errorf("device: got %q, want %q", got["device"], "/dev/sda1")
 	}
 }
 
 func TestInsertRows_TagSplitting(t *testing.T) {
-	var captured []prompb.Label
-	insertRowsHook = func(wr *prompb.WriteRequest) {
-		if len(wr.Timeseries) > 0 {
-			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
-			copy(lbls, wr.Timeseries[0].Labels)
-			captured = lbls
-		}
-	}
-	t.Cleanup(func() { insertRowsHook = nil })
+	getLabels := captureFirstSeriesLabels(t)
 
 	series := []datadogv1.Series{
 		{
@@ -321,18 +328,15 @@ func TestInsertRows_TagSplitting(t *testing.T) {
 		t.Fatalf("tag splitting returned unexpected error: %v", err)
 	}
 
-	labelMap := map[string]string{}
-	for _, l := range captured {
-		labelMap[l.Name] = l.Value
+	got := toLabelMap(getLabels())
+	if got["env"] != "prod" {
+		t.Errorf("env: got %q, want %q", got["env"], "prod")
 	}
-	if labelMap["env"] != "prod" {
-		t.Errorf("env: got %q, want %q", labelMap["env"], "prod")
-	}
-	if labelMap["region"] != "us-east-1" {
-		t.Errorf("region: got %q, want %q", labelMap["region"], "us-east-1")
+	if got["region"] != "us-east-1" {
+		t.Errorf("region: got %q, want %q", got["region"], "us-east-1")
 	}
 	// A tag with no ":" separator produces an empty value.
-	if _, ok := labelMap["notag"]; !ok {
+	if _, ok := got["notag"]; !ok {
 		t.Errorf("expected label 'notag' to be present (split with empty value)")
 	}
 }
@@ -340,15 +344,7 @@ func TestInsertRows_TagSplitting(t *testing.T) {
 func TestInsertRows_HostTagRenamedToExportedHost(t *testing.T) {
 	// A "host" tag in Tags must be renamed to "exported_host" to avoid
 	// collision with the top-level Host field (verified via insertRowsHook).
-	var captured []prompb.Label
-	insertRowsHook = func(wr *prompb.WriteRequest) {
-		if len(wr.Timeseries) > 0 {
-			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
-			copy(lbls, wr.Timeseries[0].Labels)
-			captured = lbls
-		}
-	}
-	t.Cleanup(func() { insertRowsHook = nil })
+	getLabels := captureFirstSeriesLabels(t)
 
 	series := []datadogv1.Series{
 		{
@@ -362,17 +358,15 @@ func TestInsertRows_HostTagRenamedToExportedHost(t *testing.T) {
 		t.Fatalf("host tag rename returned unexpected error: %v", err)
 	}
 
-	labelMap := map[string]string{}
-	for _, l := range captured {
-		labelMap[l.Name] = l.Value
-	}
+	captured := getLabels()
+	got := toLabelMap(captured)
 	// Top-level Host field must appear as "host".
-	if labelMap["host"] != "real-host" {
-		t.Errorf("host: got %q, want %q", labelMap["host"], "real-host")
+	if got["host"] != "real-host" {
+		t.Errorf("host: got %q, want %q", got["host"], "real-host")
 	}
 	// Tags["host:tag-host"] must be renamed to "exported_host".
-	if labelMap["exported_host"] != "tag-host" {
-		t.Errorf("exported_host: got %q, want %q", labelMap["exported_host"], "tag-host")
+	if got["exported_host"] != "tag-host" {
+		t.Errorf("exported_host: got %q, want %q", got["exported_host"], "tag-host")
 	}
 	// The raw "host" key from Tags must NOT appear twice (it was renamed).
 	count := 0
@@ -387,15 +381,7 @@ func TestInsertRows_HostTagRenamedToExportedHost(t *testing.T) {
 }
 
 func TestInsertRows_ExtraLabels(t *testing.T) {
-	var captured []prompb.Label
-	insertRowsHook = func(wr *prompb.WriteRequest) {
-		if len(wr.Timeseries) > 0 {
-			lbls := make([]prompb.Label, len(wr.Timeseries[0].Labels))
-			copy(lbls, wr.Timeseries[0].Labels)
-			captured = lbls
-		}
-	}
-	t.Cleanup(func() { insertRowsHook = nil })
+	getLabels := captureFirstSeriesLabels(t)
 
 	series := []datadogv1.Series{
 		{
@@ -411,15 +397,12 @@ func TestInsertRows_ExtraLabels(t *testing.T) {
 		t.Fatalf("extra labels returned unexpected error: %v", err)
 	}
 
-	labelMap := map[string]string{}
-	for _, l := range captured {
-		labelMap[l.Name] = l.Value
+	got := toLabelMap(getLabels())
+	if got["datacenter"] != "dc1" {
+		t.Errorf("datacenter: got %q, want %q", got["datacenter"], "dc1")
 	}
-	if labelMap["datacenter"] != "dc1" {
-		t.Errorf("datacenter: got %q, want %q", labelMap["datacenter"], "dc1")
-	}
-	if labelMap["team"] != "ops" {
-		t.Errorf("team: got %q, want %q", labelMap["team"], "ops")
+	if got["team"] != "ops" {
+		t.Errorf("team: got %q, want %q", got["team"], "ops")
 	}
 }
 
